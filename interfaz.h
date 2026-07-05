@@ -4,7 +4,8 @@
 #include <WebServer.h>
 
 extern WebServer server;
-extern bool relayState;
+extern bool systemRunning;
+extern bool rainForecast;
 extern int moisturePercentage;
 extern String moistureStatusText;
 extern String treeColor;
@@ -12,7 +13,8 @@ extern String wateringTime1;
 extern String wateringTime2;
 extern int wateringDurationSeconds;
 
-void sendHtml() {
+// showRainWarning=true muestra advertencia de lluvia con botón para forzar el riego
+void sendHtml(bool showRainWarning = false) {
   String response = R"(
 <!DOCTYPE html>
 <html lang="es">
@@ -577,7 +579,7 @@ void sendHtml() {
                 <span class="card-icon">💧</span>
                 <h2>Estado de Humedad</h2>
             </div>
-            <p class="card-description">Nivel de humedad actual y pronóstico de riego</p>
+            <p class="card-description">Nivel de humedad actual y pronóstico de riego (4 electroválvulas en cascada)</p>
             
             <div class="tree-container">
                 <div class="tree-svg-wrapper">
@@ -609,14 +611,18 @@ void sendHtml() {
         <div class="card">
             <div class="card-header">
                 <span class="card-icon">🚀</span>
-                <h2>Control Manual</h2>
+                <h2>Control Manual (Web)</h2>
             </div>
-            <p class="card-description">Activa o desactiva la bomba de agua manualmente</p>
+            <p class="card-description">Inicia o cancela el ciclo completo de riego en cascada (Aspersor 1 a 4) desde la web</p>
             
             RELAY_BUTTON_HTML
 
             <div class="info-box">
-                <strong>⚠️ Nota:</strong> El sistema tiene un apagado automático de seguridad tras 1 minuto si olvidas desactivar el riego.
+                <strong>🔘 Botón físico:</strong> El sistema también cuenta con un botón físico normalmente abierto conectado directamente al ESP32. Funciona aunque no haya WiFi ni internet: un toque inicia la cascada de riego y otro toque la cancela.
+            </div>
+
+            <div class="info-box warning">
+                <strong>⚠️ Nota:</strong> El ciclo recorre las 4 electroválvulas en cascada (una a la vez); puedes cancelarlo en cualquier momento desde la web o con el botón físico.
             </div>
         </div>
 
@@ -641,9 +647,9 @@ void sendHtml() {
                 </div>
 
                 <div class="form-group">
-                    <label for="duration">⏱️ Duración Máxima de Riego:</label>
+                    <label for="duration">⏱️ Duración por Aspersor:</label>
                     <input type="number" id="duration" name="duration" min="1" max="300" value="DURATION_VALUE" required>
-                    <small style="color: var(--text-light);">En segundos (máximo 300)</small>
+                    <small style="color: var(--text-light);">En segundos por cada una de las 4 electroválvulas (máximo 300)</small>
                 </div>
 
                 <button type="submit" class="btn btn-info">💾 Guardar Programación</button>
@@ -663,7 +669,7 @@ void sendHtml() {
             </div>
 
             <div class="info-box" style="margin-top: 15px;">
-                <strong>ℹ️ Cómo funciona:</strong> En cada horario programado, el sistema consultará a la IA Gemini si hay pronóstico de lluvia. Si está despejado, regará automáticamente durante DURATION_VALUE segundos.
+                <strong>ℹ️ Cómo funciona:</strong> En cada horario programado, el sistema consultará a la IA Gemini si hay pronóstico de lluvia. Si está despejado, regará automáticamente en cascada (Aspersor 1, 2, 3 y 4) durante DURATION_VALUE segundos cada uno.
             </div>
         </div>
 
@@ -676,17 +682,17 @@ void sendHtml() {
 
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; font-size: 0.9em;">
                 <div class="schedule-item">
-                    <div class="schedule-item-label">Estado del Relé</div>
+                    <div class="schedule-item-label">Estado del Sistema</div>
                     <div class="schedule-item-status">RELAY_STATUS_BADGE</div>
                 </div>
                 <div class="schedule-item">
                     <div class="schedule-item-label">Modo</div>
-                    <div class="schedule-item-status"><span class="badge badge-success">Automático IA</span></div>
+                    <div class="schedule-item-status"><span class="badge badge-success">Automático IA + Botón Físico</span></div>
                 </div>
             </div>
 
             <div class="info-box" style="margin-top: 12px;">
-                <strong>🔒 Seguridad:</strong> El sistema está protegido con apagado automático tras 1 minuto de riego manual.
+                <strong>🔒 Seguridad:</strong> El botón físico y el botón web pueden cancelar el riego en curso en cualquier momento, incluso sin conexión a internet.
             </div>
         </div>
 
@@ -757,14 +763,29 @@ void sendHtml() {
   response.replace("MOISTURE_STATUS_TEXT", moistureStatusText);
   response.replace("HUMIDITY_PERCENT", String(moisturePercentage));
   
-  if (relayState) {
-    response.replace("RELAY_BUTTON_HTML", 
-      "<a href='/manualToggle' class='btn btn-danger'><strong>🛑 APAGAR RIEGO MANUAL</strong></a>"
+  if (systemRunning) {
+    response.replace("RELAY_BUTTON_HTML",
+      "<a href='/manualToggle' class='btn btn-danger'><strong>🛑 CANCELAR RIEGO EN CURSO</strong></a>"
     );
-    response.replace("RELAY_STATUS_BADGE", "<span class='badge badge-danger'>EN FUNCIONAMIENTO 🔴</span>");
+    response.replace("RELAY_STATUS_BADGE", "<span class='badge badge-danger'>REGANDO 🔴</span>");
+  } else if (showRainWarning) {
+    // Lluvia pronosticada: mostramos advertencia + opción de forzar
+    response.replace("RELAY_BUTTON_HTML",
+      "<div class='info-box error' style='margin-bottom:12px;'>"
+        "<strong>🌧️ Riego bloqueado por pronóstico de LLUVIA.</strong><br/>"
+        "La IA detectó lluvia para hoy. Si aun así necesitas regar, pulsa el botón de abajo."
+      "</div>"
+      "<a href='/forceWater' class='btn btn-danger'>"
+        "<strong>⚠️ FORZAR RIEGO (ignorar lluvia)</strong>"
+      "</a>"
+      "<a href='/' class='btn btn-info' style='margin-top:6px;'>"
+        "<strong>↩️ Cancelar</strong>"
+      "</a>"
+    );
+    response.replace("RELAY_STATUS_BADGE", "<span class='badge badge-warning'>BLOQUEADO 🌧️</span>");
   } else {
-    response.replace("RELAY_BUTTON_HTML", 
-      "<a href='/manualToggle' class='btn btn-primary'><strong>▶️ ENCENDER RIEGO MANUAL</strong></a>"
+    response.replace("RELAY_BUTTON_HTML",
+      "<a href='/manualToggle' class='btn btn-primary'><strong>▶️ INICIAR RIEGO EN CASCADA (4 ASPERSORES)</strong></a>"
     );
     response.replace("RELAY_STATUS_BADGE", "<span class='badge badge-success'>INACTIVO ✓</span>");
   }
