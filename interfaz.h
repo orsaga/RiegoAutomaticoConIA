@@ -13,8 +13,7 @@ extern String wateringTime1;
 extern String wateringTime2;
 extern int wateringDurationSeconds;
 
-// showRainWarning=true muestra advertencia de lluvia con botón para forzar el riego
-void sendHtml(bool showRainWarning = false) {
+void sendHtml() {
   String response = R"(
 <!DOCTYPE html>
 <html lang="es">
@@ -605,6 +604,10 @@ void sendHtml(bool showRainWarning = false) {
                     <div class="moisture-percentage">HUMIDITY_PERCENT%</div>
                 </div>
             </div>
+
+            <a href="/refreshWeather" class="btn btn-info" style="margin-top:8px;">
+                🔄 Actualizar pronóstico ahora
+            </a>
         </div>
 
         <!-- CARD: CONTROL MANUAL -->
@@ -768,21 +771,6 @@ void sendHtml(bool showRainWarning = false) {
       "<a href='/manualToggle' class='btn btn-danger'><strong>🛑 CANCELAR RIEGO EN CURSO</strong></a>"
     );
     response.replace("RELAY_STATUS_BADGE", "<span class='badge badge-danger'>REGANDO 🔴</span>");
-  } else if (showRainWarning) {
-    // Lluvia pronosticada: mostramos advertencia + opción de forzar
-    response.replace("RELAY_BUTTON_HTML",
-      "<div class='info-box error' style='margin-bottom:12px;'>"
-        "<strong>🌧️ Riego bloqueado por pronóstico de LLUVIA.</strong><br/>"
-        "La IA detectó lluvia para hoy. Si aun así necesitas regar, pulsa el botón de abajo."
-      "</div>"
-      "<a href='/forceWater' class='btn btn-danger'>"
-        "<strong>⚠️ FORZAR RIEGO (ignorar lluvia)</strong>"
-      "</a>"
-      "<a href='/' class='btn btn-info' style='margin-top:6px;'>"
-        "<strong>↩️ Cancelar</strong>"
-      "</a>"
-    );
-    response.replace("RELAY_STATUS_BADGE", "<span class='badge badge-warning'>BLOQUEADO 🌧️</span>");
   } else {
     response.replace("RELAY_BUTTON_HTML",
       "<a href='/manualToggle' class='btn btn-primary'><strong>▶️ INICIAR RIEGO EN CASCADA (4 ASPERSORES)</strong></a>"
