@@ -1,9 +1,11 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WiFiUdp.h>
+#include <WiFiClientSecure.h>
 #include <NTPClient.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <time.h>
 #include "interfaz.h"
 #include <Preferences.h>
 
@@ -14,9 +16,16 @@ Preferences prefs;
 #define WIFI_PASSWORD "willpower"
 #define WIFI_CHANNEL 6
 
-// --- CREDENCIALES DE GOOGLE GEMINI ---
-const char* GEMINI_API_KEY = "AQ.Ab8RN6JpotzahNznOlpQsgKYk2XVukc50oISh79JjIDRiCNphw";
-const String GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=";
+// --- API METEOROLÓGICA REAL (Open-Meteo) ---
+// Open-Meteo es gratuita y no requiere API key, por eso ya no dependemos
+// de Gemini (ni de sus errores 401 por keys revocadas) para el pronóstico.
+// Coordenadas de La Dorada, Caldas, Colombia.
+const float LATITUD_LA_DORADA = 5.44783;
+const float LONGITUD_LA_DORADA = -74.66311;
+
+// Umbral: si la probabilidad de lluvia en las próximas 2 horas supera este
+// valor, se suspende el riego. Mismo criterio que usábamos con Gemini.
+const int UMBRAL_SUSPENSION_RIEGO = 60;
 
 // --- CONFIGURACIÓN DE PINES (4 ELECTROVÁLVULAS) ---
 const int RELAY_PINS[4] = {26, 27, 25, 32}; // Cambia estos números por tus pines físicos disponibles
@@ -34,11 +43,15 @@ const unsigned long DEBOUNCE_DELAY = 50; // ms
 WebServer server(80);
 bool systemRunning = false;   // Indica si hay un ciclo de riego activo (manual, físico o automático)
 bool rainForecast = false;    // true = la IA detectó lluvia, false = despejado
-int fallosConsecutivos = 0;    // Si Gemini falla muchas veces seguidas, reseteamos el bloqueo
+int fallosConsecutivos = 0;    // Si la consulta al clima falla muchas veces seguidas, reseteamos el bloqueo
 int moistureValue = 0;
 int moisturePercentage = 100;
 String moistureStatusText = "Monitoreo por Clima (Previsión)";
 String treeColor = "#66BB6A";
+
+// Última probabilidad de lluvia real reportada por Open-Meteo (0-100).
+// Se conserva entre lecturas para no "inventar" un valor si algo falla.
+int ultimaProbabilidadLluvia = 20;
 
 // --- VARIABLES PARA LA PROGRAMACIÓN DE RIEGO ---
 WiFiUDP ntpUDP;
@@ -60,90 +73,132 @@ void apagarTodo() {
   systemRunning = false;
 }
 
-// Actualiza los elementos visuales de la interfaz web según el estado climático
-void actualizarEstadoInterfaz(bool vaALlover) {
+// Actualiza los elementos visuales de la interfaz web según el estado climático.
+// AHORA recibe también la probabilidad real de lluvia (0-100) reportada por Open-Meteo,
+// en vez de usar un 30% o 90% fijo.
+void actualizarEstadoInterfaz(bool vaALlover, int probabilidadLluvia) {
+  // El porcentaje mostrado en la barra/árbol es directamente la probabilidad de lluvia real.
+  moisturePercentage = probabilidadLluvia;
+
   if (vaALlover) {
-    moistureStatusText = "Pronóstico: LLUVIA (Riego Suspendido)";
-    moisturePercentage = 90;
+    moistureStatusText = "Pronostico: LLUVIA (" + String(probabilidadLluvia) + "% - Riego Suspendido)";
     treeColor = "#2E7D32";
   } else {
-    moistureStatusText = "Pronóstico: DESPEJADO (Listo para Riego)";
-    moisturePercentage = 30;
+    moistureStatusText = "Pronostico: DESPEJADO (" + String(probabilidadLluvia) + "% - Listo para Riego)";
     treeColor = "#66BB6A";
   }
 }
 
-bool preguntarAIARegar() {
+// Consulta Open-Meteo y obtiene la probabilidad real de lluvia (0-100) para
+// la hora actual y las 2 siguientes (tomamos el máximo del rango).
+// Devuelve true si la consulta fue exitosa y llena probabilidadOut.
+bool consultarClimaReal(int &probabilidadOut) {
   if (WiFi.status() != WL_CONNECTED) {
-    // Sin WiFi: usamos el ultimo pronostico conocido para no regar si antes habia lluvia.
-    Serial.println("Sin WiFi: usando ultimo pronostico conocido.");
-    return !rainForecast;
+    Serial.println("Sin WiFi: no se puede consultar Open-Meteo.");
+    return false;
   }
 
+  if (!timeClient.update() && !timeClient.isTimeSet()) {
+    Serial.println("No se pudo obtener la hora NTP para comparar con Open-Meteo.");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Open-Meteo: no verificamos certificado (suficiente para este uso)
   HTTPClient http;
-  String urlCompleta = GEMINI_URL + String(GEMINI_API_KEY);
-  http.begin(urlCompleta);
-  http.addHeader("Content-Type", "application/json");
 
-  String prompt = "Eres un agronomo experto. Consulta el pronostico meteorologico actual para La Dorada, Caldas, Colombia. ";
-  prompt += "Necesito saber si debo regar mis cultivos en las proximas 2 horas. ";
-  prompt += "Regla: responde ESPERAR solo si la probabilidad de lluvia supera el 60% O si ya esta lloviendo con intensidad moderada o fuerte. ";
-  prompt += "Una llovizna leve, humedad alta o probabilidad menor al 60% NO es motivo para suspender el riego. ";
-  prompt += "Responde unicamente con una sola palabra en mayusculas: REGAR o ESPERAR. Sin explicaciones ni signos.";
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(LATITUD_LA_DORADA, 4) +
+               "&longitude=" + String(LONGITUD_LA_DORADA, 4) +
+               "&hourly=precipitation_probability&timezone=America%2FBogota&forecast_days=2";
 
-  String payload = "{\"contents\":[{\"parts\":[{\"text\":\"" + prompt + "\"}]}]}";
-  int httpResponseCode = http.POST(payload);
-  bool decisionRiego = false;
-  bool pronosticoLluvia = false;
-  bool consultaExitosa = false;
+  http.begin(client, url);
+  int httpCode = http.GET();
 
-  if (httpResponseCode == 200) {
-    String response = http.getString();
-    DynamicJsonDocument doc(4096);
-    if (!deserializeJson(doc, response)) {
-      String respuestaIA = doc["candidates"][0]["content"]["parts"][0]["text"].as<String>();
-      respuestaIA.trim();
-      respuestaIA.toUpperCase();
-      Serial.println("Respuesta de Gemini: " + respuestaIA);
+  if (httpCode != 200) {
+    Serial.print("Error Open-Meteo HTTP: ");
+    Serial.println(httpCode);
+    http.end();
+    return false;
+  }
 
-      // indexOf en vez de comparacion exacta: tolera puntuacion o texto extra de Gemini
-      if (respuestaIA.indexOf("REGAR") >= 0) {
-        decisionRiego = true;
-        pronosticoLluvia = false;
-        consultaExitosa = true;
-      } else if (respuestaIA.indexOf("ESPERAR") >= 0) {
-        decisionRiego = false;
-        pronosticoLluvia = true;
-        consultaExitosa = true;
-      } else {
-        // Gemini respondio algo inesperado: respetamos el ultimo pronostico conocido
-        Serial.println("Respuesta inesperada de Gemini. Usando ultimo pronostico.");
-        pronosticoLluvia = rainForecast;
-        decisionRiego = !rainForecast;
-      }
+  String response = http.getString();
+  http.end();
 
-      if (consultaExitosa) {
-        rainForecast = pronosticoLluvia;
-        fallosConsecutivos = 0; // Resetear contador al tener respuesta válida
-      }
-      if (!systemRunning) {
-        actualizarEstadoInterfaz(pronosticoLluvia);
-      }
+  DynamicJsonDocument doc(16384);
+  DeserializationError error = deserializeJson(doc, response);
+  if (error) {
+    Serial.print("Error al parsear JSON de Open-Meteo: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+
+  JsonArray tiempos = doc["hourly"]["time"];
+  JsonArray probabilidades = doc["hourly"]["precipitation_probability"];
+
+  if (tiempos.size() == 0 || probabilidades.size() == 0) {
+    Serial.println("Open-Meteo no devolvio datos horarios validos.");
+    return false;
+  }
+
+  // Construimos el string de la hora actual en el mismo formato que usa
+  // Open-Meteo para el array "time": "YYYY-MM-DDTHH:00"
+  time_t rawTime = timeClient.getEpochTime();
+  struct tm *horaLocal = localtime(&rawTime);
+  char horaActualStr[20];
+  sprintf(horaActualStr, "%04d-%02d-%02dT%02d:00",
+          horaLocal->tm_year + 1900, horaLocal->tm_mon + 1,
+          horaLocal->tm_mday, horaLocal->tm_hour);
+
+  int indiceActual = -1;
+  for (size_t i = 0; i < tiempos.size(); i++) {
+    if (String(tiempos[i].as<const char*>()) == String(horaActualStr)) {
+      indiceActual = i;
+      break;
     }
+  }
+
+  if (indiceActual == -1) {
+    Serial.println("No se encontro la hora actual dentro de los datos de Open-Meteo.");
+    return false;
+  }
+
+  // Tomamos el maximo de probabilidad entre la hora actual y las 2 siguientes
+  int maxProbabilidad = 0;
+  for (int i = indiceActual; i < indiceActual + 3 && i < (int)probabilidades.size(); i++) {
+    int p = probabilidades[i].as<int>();
+    if (p > maxProbabilidad) maxProbabilidad = p;
+  }
+
+  probabilidadOut = maxProbabilidad;
+  return true;
+}
+
+bool preguntarAIARegar() {
+  int probabilidad = ultimaProbabilidadLluvia; // valor de respaldo si la consulta falla
+  bool consultaExitosa = consultarClimaReal(probabilidad);
+
+  bool pronosticoLluvia;
+  bool decisionRiego;
+
+  if (consultaExitosa) {
+    Serial.println("Open-Meteo: probabilidad de lluvia (proximas 2h) = " + String(probabilidad) + "%");
+    pronosticoLluvia = (probabilidad > UMBRAL_SUSPENSION_RIEGO);
+    decisionRiego = !pronosticoLluvia;
+    rainForecast = pronosticoLluvia;
+    ultimaProbabilidadLluvia = probabilidad;
+    fallosConsecutivos = 0;
   } else {
-    // CORRECCIÓN: antes decisionRiego=true siempre que fallara la llamada,
-    // por eso regaba aunque la pantalla mostrara LLUVIA (el display quedaba del
-    // chequeo anterior exitoso, pero el automatico fallaba y usaba el fallback).
-    // Ahora: si el ultimo pronostico conocido era lluvia, NO regamos.
-    Serial.print("Error Gemini HTTP: ");
-    Serial.println(httpResponseCode);
+    // Si falla la consulta, NO regamos si el ultimo pronostico conocido era lluvia.
+    Serial.println("Fallo la consulta a Open-Meteo. Usando ultimo pronostico conocido.");
     pronosticoLluvia = rainForecast;
     decisionRiego = !rainForecast;
-    if (!systemRunning) {
-      actualizarEstadoInterfaz(pronosticoLluvia);
-    }
+    fallosConsecutivos++;
   }
-  http.end();
+
+  if (!systemRunning) {
+    actualizarEstadoInterfaz(pronosticoLluvia, ultimaProbabilidadLluvia);
+  }
+
   return decisionRiego;
 }
 
@@ -184,6 +239,7 @@ void ejecutarCicloRiego(String tipoOrigen) {
   // Al finalizar todo el ciclo devolvemos los valores normales
   apagarTodo();
   moistureStatusText = "Ciclo de Riego Terminado";
+  moisturePercentage = ultimaProbabilidadLluvia;
   treeColor = "#66BB6A";
   Serial.println("Ciclo secuencial de riego finalizado exitosamente.");
 }
@@ -212,6 +268,7 @@ void manejarBotonFisico() {
           Serial.println("Botón físico: cancelando riego en curso.");
           apagarTodo();
           moistureStatusText = "Riego cancelado con botón físico";
+          moisturePercentage = ultimaProbabilidadLluvia;
           treeColor = "#66BB6A";
         }
       }
@@ -231,6 +288,7 @@ void handleManualToggle() {
   if (systemRunning) {
     apagarTodo();
     moistureStatusText = "Riego cancelado manualmente";
+    moisturePercentage = ultimaProbabilidadLluvia;
     treeColor = "#66BB6A";
     sendHtml();
     return;
@@ -255,11 +313,11 @@ void handleForceWater() {
   }
 }
 
-// Fuerza una nueva consulta a Gemini y actualiza el pronóstico en pantalla
+// Fuerza una nueva consulta a Open-Meteo y actualiza el pronóstico en pantalla
 void handleRefreshWeather() {
   Serial.println("Actualización manual del pronóstico solicitada.");
   fallosConsecutivos = 0; // Resetear para que no entre en modo degradado
-  preguntarAIARegar();    // Consulta y actualiza rainForecast + interfaz
+  preguntarAIARegar();    // Consulta Open-Meteo y actualiza rainForecast + probabilidad + interfaz
   server.sendHeader("Location", "/");
   server.send(303);
 }
@@ -356,6 +414,10 @@ void setup() {
   server.on("/setSchedule", handleSetSchedule);
   server.begin();
   Serial.println("Servidor Web activo.");
+
+  // Consulta inicial para que el porcentaje mostrado sea real desde el arranque,
+  // en vez de quedarse en el valor por defecto (100) hasta la primera consulta automática.
+  preguntarAIARegar();
 }
 
 void loop() {
